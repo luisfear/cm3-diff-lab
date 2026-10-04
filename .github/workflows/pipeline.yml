@@ -1,0 +1,184 @@
+name: pipeline
+run-name: "pipeline · set ${{ inputs.set || '0' }}${{ inputs.fast == 'yes' && ' · fast' || '' }}"
+
+# Full differential run, split across parallel jobs and joined at the end.
+# Manual only (it needs the decryption secret). Each job unseals the archive,
+# runs its chunk, optionally confirms the real differences across scheduling
+# phases, and uploads an encrypted result. The join job merges them, prints a
+# fingerprint, and uploads the merged (encrypted) result. Public logs carry only
+# counters and hashes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: "parallel jobs (max 20 on the free plan)"
+        default: "10"
+      procs:
+        description: "worker processes per job"
+        default: "2"
+      phase:
+        description: "confirm real differences across phases (yes/no)"
+        default: "yes"
+      set:
+        description: "test set number (0 = default set; the sealed plug-in maps the others)"
+        default: "0"
+      fast:
+        description: "reduced selection of the set (yes/no)"
+        default: "no"
+
+permissions:
+  contents: read
+  statuses: write
+
+env:
+  TEST_SET: ${{ inputs.set || '0' }}
+
+concurrency:
+  group: pipeline-${{ github.ref }}-${{ inputs.set || '0' }}-${{ inputs.fast || 'no' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          n = int("${{ inputs.chunks || '10' }}")
+          print("matrix=" + json.dumps({"i": list(range(1, n + 1))}))
+          PY
+
+  chunk:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            engine
+            tools
+            payload.bin
+            requirements.txt
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache virtualenv
+        id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('requirements.txt') }}
+      - name: Environment
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: python -m venv .venv && ./.venv/bin/pip install -q -r requirements.txt
+      - name: Decrypt the archive
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+        run: |
+          printf '%s' "$PAYLOAD_KEY" > /tmp/key
+          ./.venv/bin/python tools/unseal.py payload.bin /tmp/plugin --key /tmp/key
+      - name: Run chunk ${{ matrix.i }} of ${{ inputs.chunks }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out
+          : > /tmp/progress.txt
+          bash tools/live_status.sh watch /tmp/progress.txt part-${{ matrix.i }} &
+          WATCHER=$!
+          trap 'kill "$WATCHER" 2>/dev/null || true' EXIT
+          rc=0
+          ./.venv/bin/python tools/run_wrapped.py --key /tmp/key --detail out/chunk-${{ matrix.i }}.log.bin --tail 1 \
+            --progress /tmp/progress.txt -- \
+            ./.venv/bin/python -m engine.harness run \
+              --plugin /tmp/plugin --key /tmp/key --out out/chunk-${{ matrix.i }}.result.bin \
+              --index ${{ matrix.i }} --n ${{ inputs.chunks || '10' }} --procs "${{ inputs.procs || '2' }}" \
+              ${{ inputs.fast == 'yes' && '--fast' || '' }} || rc=$?
+          kill "$WATCHER" 2>/dev/null || true
+          bash tools/live_status.sh final /tmp/progress.txt part-${{ matrix.i }} "$rc"
+          exit "$rc"
+      - name: Confirm across phases
+        if: inputs.phase == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          : > /tmp/progress2.txt
+          bash tools/live_status.sh watch /tmp/progress2.txt phase-${{ matrix.i }} &
+          WATCHER=$!
+          trap 'kill "$WATCHER" 2>/dev/null || true' EXIT
+          rc=0
+          ./.venv/bin/python tools/run_wrapped.py --key /tmp/key --detail out/chunk-${{ matrix.i }}.phase.log.bin --tail 1 \
+            --progress /tmp/progress2.txt -- \
+            ./.venv/bin/python -m engine.phase \
+              --plugin /tmp/plugin --key /tmp/key --result out/chunk-${{ matrix.i }}.result.bin \
+              --out out/chunk-${{ matrix.i }}.phase.bin --procs "${{ inputs.procs || '2' }}" \
+              ${{ inputs.fast == 'yes' && '--fast' || '' }} || rc=$?
+          kill "$WATCHER" 2>/dev/null || true
+          bash tools/live_status.sh final /tmp/progress2.txt phase-${{ matrix.i }} "$rc"
+          exit "$rc"
+      - name: Scrub the key
+        if: always()
+        run: shred -u /tmp/key 2>/dev/null || rm -f /tmp/key
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chunk-${{ matrix.i }}
+          path: out/*.bin
+          retention-days: 3
+
+  join:
+    needs: chunk
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            engine
+            tools
+            requirements.txt
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache virtualenv
+        id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('requirements.txt') }}
+      - name: Environment
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: python -m venv .venv && ./.venv/bin/pip install -q -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          path: parts
+      - name: Merge
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+        run: |
+          printf '%s' "$PAYLOAD_KEY" > /tmp/key
+          FP=$(./.venv/bin/python -m engine.harness join \
+                 $(find parts -name 'chunk-*.result.bin' | sort) --key /tmp/key --out merged.result.bin)
+          echo "$FP"
+          {
+            echo "### pipeline result"
+            echo '```json'
+            echo "$FP"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          shred -u /tmp/key 2>/dev/null || rm -f /tmp/key
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: merged.result.bin
+          retention-days: 7

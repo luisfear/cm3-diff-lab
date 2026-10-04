@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+out/
+*.result.bin
+*.log.bin
+*.phase.bin
+# never commit a passphrase
+key
+*.key
+payload_key*

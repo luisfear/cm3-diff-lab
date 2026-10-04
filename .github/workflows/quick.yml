@@ -1,0 +1,113 @@
+name: quick
+run-name: "quick · set ${{ inputs.set || '0' }}"
+
+# Fast differential pass. Manual only: it needs the decryption secret, so it must
+# never run from a fork or an untrusted event. The encrypted archive is unsealed
+# into a temporary directory, the engine runs a reduced test set, and only
+# counters and a hash reach the log. The full result is uploaded encrypted.
+
+on:
+  workflow_dispatch:
+    inputs:
+      procs:
+        description: "worker processes"
+        default: "4"
+      set:
+        description: "test set number (0 = default set; the sealed plug-in maps the others)"
+        default: "0"
+
+permissions:
+  contents: read
+  statuses: write
+
+env:
+  TEST_SET: ${{ inputs.set || '0' }}
+
+concurrency:
+  group: quick-${{ github.ref }}-${{ inputs.set || '0' }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            engine
+            tools
+            payload.bin
+            requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache virtualenv
+        id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('requirements.txt') }}
+
+      - name: Environment
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: python -m venv .venv && ./.venv/bin/pip install -q -r requirements.txt
+
+      - name: Decrypt the archive
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+        run: |
+          printf '%s' "$PAYLOAD_KEY" > /tmp/key
+          ./.venv/bin/python tools/unseal.py payload.bin /tmp/plugin --key /tmp/key
+          echo "decrypted"
+
+      - name: Run (fast)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out
+          : > /tmp/progress.txt
+          bash tools/live_status.sh watch /tmp/progress.txt part-1 &
+          WATCHER=$!
+          trap 'kill "$WATCHER" 2>/dev/null || true' EXIT
+          rc=0
+          ./.venv/bin/python tools/run_wrapped.py --key /tmp/key --detail out/quick.log.bin --tail 1 \
+            --progress /tmp/progress.txt -- \
+            ./.venv/bin/python -m engine.harness run \
+              --plugin /tmp/plugin --key /tmp/key --out out/quick.result.bin \
+              --fast --procs "${{ inputs.procs || '2' }}" || rc=$?
+          kill "$WATCHER" 2>/dev/null || true
+          bash tools/live_status.sh final /tmp/progress.txt part-1 "$rc"
+          exit "$rc"
+
+      - name: Confirm across phases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          : > /tmp/progress2.txt
+          bash tools/live_status.sh watch /tmp/progress2.txt phase-1 &
+          WATCHER=$!
+          trap 'kill "$WATCHER" 2>/dev/null || true' EXIT
+          rc=0
+          ./.venv/bin/python tools/run_wrapped.py --key /tmp/key --detail out/quick.phase.log.bin --tail 1 \
+            --progress /tmp/progress2.txt -- \
+            ./.venv/bin/python -m engine.phase \
+              --plugin /tmp/plugin --key /tmp/key --result out/quick.result.bin \
+              --out out/quick.phase.bin --fast --procs "${{ inputs.procs || '2' }}" || rc=$?
+          kill "$WATCHER" 2>/dev/null || true
+          bash tools/live_status.sh final /tmp/progress2.txt phase-1 "$rc"
+          exit "$rc"
+
+      - name: Scrub the key
+        if: always()
+        run: shred -u /tmp/key 2>/dev/null || rm -f /tmp/key
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quick-result
+          path: out/*.bin
+          retention-days: 7
